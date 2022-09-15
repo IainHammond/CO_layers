@@ -10,6 +10,7 @@ from scipy.optimize import curve_fit
 from scipy.optimize import minimize
 from scipy.signal import find_peaks
 from scipy.stats import binned_statistic
+from astropy.convolution import Gaussian2DKernel, convolve, convolve_fft
 
 import casa_cube
 
@@ -124,8 +125,12 @@ class Surface:
             self.x_star = (cube.nx/2 +1) + (dRA*np.pi/(180 * 3600))/np.abs(cube.header['CDELT1']*np.pi/180)
             self.y_star = (cube.ny/2 +1) + (dDec*np.pi/(180 * 3600))/np.abs(cube.header['CDELT2']*np.pi/180)
 
+        # This is where the actual work happens
+        self._rotate_cube()
         self._extract_isovelocity()
+        self._compute_surface()
 
+        # Making plots
         if plot:
             self.plot_channels(num=num+8)
 
@@ -135,8 +140,6 @@ class Surface:
         else:
             print("Estimating inclination:")
             self.find_i(num)
-
-        self._compute_surface()
 
         if dist is not None:
             self.dist = dist
@@ -148,6 +151,7 @@ class Surface:
                 self.plot_surfaces(num=num+9)
 
         return
+
 
     def _initial_guess(self,num=0,std=None):
         """
@@ -350,7 +354,47 @@ class Surface:
 
         return
 
-    def _extract_isovelocity(self):
+    def _rotate_cube(self):
+
+        # Rotate star position
+        angle = np.deg2rad(self.PA - self.inc_sign * 90.0)
+        center = (np.array(cube.image.shape[1:3])-1)/2.
+        dx = self.x_star-center[0]
+        dy = self.y_star-center[1]
+        self.x_star_rot = center[0] + dx * np.cos(angle) + dy * np.sin(angle)
+        self.y_star_rot = center[1] - dx * np.sin(angle) + dy * np.cos(angle)
+
+        with alive_bar(int(self.iv_max-self.iv_min), title="Rotating cube") as bar:
+            for iv in range(self.iv_min,self.iv_max):
+                self.cube.image[iv,:,:] = np.array(rotate(self.cube.image[iv,:,:], self.PA - self.inc_sign * 90.0, reshape=False))
+
+        return
+
+
+    def _select_scales(self):
+        # Estimating the taper to use for the multi-scale analysis
+        #  2**n/2 * bmin up to a fraction of the disk size along semi-major axis
+
+        M0 = self.cube.get_moment_map(moment=0, threshold=5*self.std, v_minmax=v_minmax)
+
+        disk_size = 0 # (Max - Min x)  * pixelscale
+        n_beams = disk_size/bmin
+
+        print("We found ", n_beams, " beams accros the disk semi-major axis")
+
+        # We want at least 5 beams per side of the disk
+        n_scales = int(np.ceil(np.log2(n_beams/10.))) # Number of scales with a factor 2
+
+        n_scales = 2*n_scales-1 # Number of scales with a factor sqrt(2)
+        f = np.sqrt(2.)
+
+        self.n_scales = n_scales
+        self.taper = self.bmin * f**np.arange(n_scales)
+
+        return
+
+
+    def _extract_isovelocity(self,scale=0):
         """
         Infer the upper emission surface from the provided cube
         extract the emission surface in each channel and loop over channels
@@ -365,27 +409,22 @@ class Surface:
 
         cube = self.cube
         nx, nv = cube.nx, cube.nv
+        ns = self.n_scales
 
-        self.n_surf = np.zeros(nv, dtype=int)
-        self.x_sky = np.zeros([nv,nx])
-        self.y_sky = np.zeros([nv,nx,2])
-        self.Tb = np.zeros([nv,nx,2])
-        self.I = np.zeros([nv,nx,2])
-
-        # Rotate star position
-        angle = np.deg2rad(self.PA - self.inc_sign * 90.0)
-        center = (np.array(cube.image.shape[1:3])-1)/2.
-        dx = self.x_star-center[0]
-        dy = self.y_star-center[1]
-        self.x_star_rot = center[0] + dx * np.cos(angle) + dy * np.sin(angle)
-        self.y_star_rot = center[1] - dx * np.sin(angle) + dy * np.cos(angle)
+        # todo : add scales
+        self.n_surf = np.zeros([ns,nv], dtype=int)
+        self.x_sky = np.zeros([ns,nv,nx])
+        self.y_sky = np.zeros([ns,nv,nx,2])
+        self.Tb = np.zeros([ns,nv,nx,2])
+        self.I = np.zeros([ns,nv,nx,2])
 
         # Loop over the channels
         with alive_bar(int(self.iv_max-self.iv_min), title="Extracting isovelocity curves") as bar:
             for iv in range(self.iv_min,self.iv_max):
-                self._extract_isovelocity_1channel(iv)
+                # Loop over scales
+                for scale in self.scales:
+                    self._extract_isovelocity_1channel(iv,scale)
                 bar()
-            # end loop
 
         #--  Additional spectral filtering to clean the data ??
 
@@ -398,7 +437,8 @@ class Surface:
 
         return
 
-    def _extract_isovelocity_1channel(self,iv):
+
+    def _extract_isovelocity_1channel(self,iv,scale=0):
 
         clean_method1 = True # removing points where the upper surface or average surface is below star at a given x
         clean_method2 = True # removing points that deviate a lot as a function of x
@@ -406,23 +446,31 @@ class Surface:
 
         quadratic_fit = True # refine position with a quadratic fit
 
-        rotate_with_pad = False # Himanshi's rotation. There is a bug.
-
-
         if np.abs(self.cube.velocity[iv] - self.v_syst) < self.excluded_delta_v:
             self.n_surf[iv] = 0
             return
 
-        cube = self.cube
+        im = self.cube.image[iv,:,:]
         nx = cube.nx
 
-        # Rotate the image so major axis is aligned with x-axis, and the far side is at the top
-        if rotate_with_pad:
-            im = rotate_disc(cube.image[iv,:,:], PA=self.PA - self.inc_sign * 90.0, x_c=self.x_star, y_c=self.y_star)
-            self.x_star_rot = self.x_star
-            self.y_star_rot = self.y_star
-        else:
-            im = np.array(rotate(cube.image[iv,:,:], self.PA - self.inc_sign * 90.0, reshape=False))
+        if scale > 0:
+            # --- Convolution : note : todo: we only want to rotate once as this slow
+            psf = self.taper[scale]
+
+            if taper[scale] < self.bmaj:
+                delta_bmaj = self.pixelscale * FWHM_to_sigma # sigma will be 1 pixel
+            else:
+                delta_bmaj = np.sqrt(psf ** 2 - self.bmaj ** 2)
+            delta_bmin = np.sqrt(psf ** 2 - self.bmin ** 2)
+
+            sigma_x = delta_bmin / self.pixelscale * FWHM_to_sigma  # in pixels
+            sigma_y = delta_bmaj / self.pixelscale * FWHM_to_sigma  # in pixels
+
+            beam = Gaussian2DKernel(sigma_x, sigma_y, self.bpa * np.pi / 180)
+            im = convolve_fft(im, beam)
+
+            # We need to remeasure the noise
+
 
 
         # Setting up arrays in each channel map
@@ -1182,23 +1230,3 @@ def colorbar2(mappable, shift=None, width=0.05, ax=None, trim_left=0, trim_right
         cax = fig.add_axes([xmax + shift*dx, ymin, width * dx, dy])
         cax.xaxis.set_ticks_position('top')
         return fig.colorbar(mappable, cax=cax, orientation="vertical",**kwargs)
-
-
-
-def rotate_disc(channel, PA=None, x_c=None, y_c=None):
-
-    """
-    For rotating map around defined disc centre
-    """
-
-    if PA is not None:
-        padX = [channel.shape[1] - x_c, x_c]
-        padY = [channel.shape[0] - y_c, y_c]
-        imgP = np.pad(channel, [padY, padX], 'constant')
-        imgR = ndimage.rotate(imgP, PA, reshape=False)
-        im = imgR[padY[0] : -padY[1], padX[0] : -padX[1]]
-    else:
-        print('Error! Need to specify a PA')
-        sys.exit()
-
-    return im
