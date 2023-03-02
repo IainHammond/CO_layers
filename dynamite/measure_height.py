@@ -1,3 +1,15 @@
+# todo : iteractive procedure to fit proper maxima (not maxima along x)
+# - after 1extraction, fit surface with GP
+# - get isovelocity curve (could also try without by taking points before and after)
+# - find maxima along the perpendicular of the isovelocity curve
+# - iterate
+# - after some iterations, ignore points that are far from the isovelocity curve
+
+
+#todo : cleaning extraction
+# - ignore after a jump in x > 1 ??
+# - ignore after a jump in y > beam ?
+
 import astropy.constants as ac
 import matplotlib.pyplot as plt
 import numpy as np
@@ -6,11 +18,16 @@ from alive_progress import alive_bar
 from numpy import ndarray
 from scipy import ndimage
 from scipy.ndimage import rotate
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, minimize
 from scipy.optimize import minimize
+from scipy.interpolate import interp1d
 from scipy.signal import find_peaks
 from scipy.stats import binned_statistic
 from astropy.convolution import Gaussian2DKernel, convolve, convolve_fft
+import celerite
+from celerite import terms
+from scipy import signal
+
 
 import casa_cube
 
@@ -37,6 +54,7 @@ class Surface:
                  std: float = None,
                  min_iv: int = None,
                  max_iv: int = None,
+                 scales = None,
                  **kwargs):
         """
         Parameters
@@ -129,8 +147,15 @@ class Surface:
         # This is where the actual work happens
         self._rotate_cube()
 
-        self._select_scales(num=num)
+        if scales is None:
+            self._select_scales(num=num)
+        else:
+            self.scales = scales
+            self.n_scales = len([scales])
+        print("Using ", self.n_scales, " scales")
+        print("Scales are ", self.scales, " arcsec")
 
+        self._create_rotated_cube()
         self._make_multiscale_cube()
 
         self._extract_isovelocity()
@@ -397,7 +422,7 @@ class Surface:
         print("There are ", n_beams, " beams accros the disk semi-major axis")
 
         # We want at least 5 beams per side of the disk
-        n_scales = int(np.ceil(np.log2(n_beams/4.))) # Number of scales with a factor 2
+        n_scales = int(np.ceil(np.log2(n_beams/3.))) # Number of scales with a factor 2
 
         n_scales = 2*n_scales-1 # Number of scales with a factor sqrt(2)
         f = np.sqrt(2.)
@@ -405,8 +430,9 @@ class Surface:
         self.n_scales = n_scales
         self.scales = self.cube.bmin * f**(np.arange(n_scales))
 
-        print("Using ", n_scales, " scales")
-        print("Scales are ", self.scales, " arcsec")
+        return
+
+    def _create_rotated_cube(self):
 
         self.rotated_images = np.zeros((self.n_scales,self.iv_max-self.iv_min+1,self.cube.ny,self.cube.nx), dtype=np.float32)
         self.rotated_images[0,:,:,:] = self.cube.image[self.iv_min:self.iv_max+1,:,:]
@@ -489,6 +515,13 @@ class Surface:
 
                 beam = Gaussian2DKernel(sigma_x, sigma_y, self.cube.bpa * np.pi / 180)
 
+                # Measure new std
+                #self.multiscale_std[iscale] = self.cube.std * (self.cube.bmaj * self.cube.bmin) / (bmaj * bmin) # this underestimayte std at at high scales
+                im = convolve_fft(self.cube.image[0,:,:], beam)
+                im1 = convolve_fft(self.cube.image[-1,:,:], beam)
+                self.multiscale_std[iscale] = np.nanstd([im,im1])
+
+                # Make the multiscale cube
                 with alive_bar(int(self.iv_max-self.iv_min), title="Making multi-scale cube: scale #"+str(iscale)) as bar:
                     for iv in range(self.iv_min,self.iv_max):
                         im = self.rotated_images[0,iv-self.iv_min,:,:]
@@ -498,12 +531,12 @@ class Surface:
                 self.multiscale_bmaj[iscale] = bmaj
                 self.multiscale_bmin[iscale] = bmin
 
-                self.multiscale_std[iscale] = self.cube.std * (self.cube.bmaj * self.cube.bmin) / (bmaj * bmin)
-
         return
 
 
     def _extract_isovelocity_1channel(self,iv,iscale=0):
+        # Find the maxima along y as in Pinte at al. 2018
+
 
         clean_method1 = True # removing points where the upper surface or average surface is below star at a given x
         clean_method2 = True # removing points that deviate a lot as a function of x
@@ -646,6 +679,78 @@ class Surface:
         return
 
 
+    def _refine_isovelocity_1channel(self,iv,iscale=0):
+        # Find iteratively the maxima along the perpendicular to the isovelocity curve
+        # then remap on the initial regular x_spacing so we can compute the altitude
+
+        # First we only keep points with no jump in x
+
+        n = self.n_surf[iscale,iv]
+        x = self.x_sky[iscale,iv,:n]
+        y = self.y_sky[iscale,iv,:n,1] # 1 surface for now
+
+        nbeams = 2. # cut along 1 beam ??
+        f =  nbeams*self.multiscale_bmaj[iscale] / self.cube.pixelscale
+        npix = int(np.floor(f)) # number of "pixels" along cut
+
+        x_new = np.zeros(n)
+        y_new = np.zeros(n)
+
+        # We smooth a bit the previous extraction to avoid too much randomess in the cut direction
+        y = signal.savgol_filter(y, window_length=5, polyorder=3, mode="nearest")
+
+        for i in range(n):
+            xc = x[i]
+            yc = y[i]
+
+            j = np.maximum(np.minimum(i,n-2),1) # dealing with ends
+            dy = -(x[j+1]-x[j-1])
+            dx = y[j+1]-y[j-1]
+
+            norm = np.sqrt(dx**2 + dy**2)
+            dy /= norm
+            dx /= norm
+
+            # We flip sign of cut if dx is <0
+            if dx<0:
+                dx=-dx
+                dy=-dy
+
+            x0 = xc - f * dx
+            y0 = yc - f * dy
+
+            x1 = xc + f * dx
+            y1 = yc + f * dy
+
+            if (i==30):
+                print("----------------")
+                print("xc=", xc, i, j)
+                print("x=",  x[j+1], x[j-1])
+                print("y=",  y[j+1], y[j-1])
+
+                print("cut vector dxy=",dx,dy)
+
+                print(x0, y0)
+                print(x1,y1)
+
+            x_cut, y_cut, z_cut = self.cube.make_cut(x0,y0,x1,y1, z = self.rotated_images[iscale,iv-self.iv_min,:,:], num=npix)
+
+            imax = np.argmax(z_cut)
+
+            x_new[i] = x_cut[imax]
+            y_new[i] = y_cut[imax]
+
+            if (i==30):
+                print("new=", x_new[i], y_new[i])
+
+        # reinterpolating new extracted surface on regular x
+        f = interp1d(x_new,y_new,fill_value="extrapolate")
+        y = f(x)
+
+        self.x_sky[iscale,iv,:n] = x
+        self.y_sky[iscale,iv,:n,1] = y
+
+
     def _compute_surface(self):
         """
         Deproject the detected surfaces to estimate, r,h, and v of the emitting layer
@@ -672,7 +777,7 @@ class Surface:
         y_c = 0.5 * (y_f + y_n)
         #y_c = np.ma.masked_array(y_c,mask).compressed()
 
-        x = self.x_sky - self.x_star_rot
+        x = self.x_sky[:,:,:] - self.x_star_rot
 
         # inclination plays a role from here
         y = (y_f - y_c) / np.cos(inc_rad)
@@ -824,6 +929,7 @@ class Surface:
                       dist: float = None,
                       plot_power_law: bool = False,
                       plot_tapered_power_law: bool = False,
+                      plot_gp: bool = False,
                       r0: float = 1.0,
                       save = None,
                       num = None,
@@ -874,7 +980,7 @@ class Surface:
         h = self.h[scales,:,:]
         v = self.v[scales,:,:]
         dv = np.abs(self.dv[scales,:,:])
-        T = np.mean(self.Tb[scales,:,:,:],axis=4)
+        T = np.mean(self.Tb[scales,:,:,:],axis=-1)
 
         r_data = r.ravel().compressed()#[np.invert(mask.ravel())]
         h_data = h.ravel().compressed()#[np.invert(mask.ravel())]
@@ -901,6 +1007,8 @@ class Surface:
         ax[0].errorbar(bins[0,:], bins[1,:],yerr=std, ecolor="grey", fmt='o', mec='k', mfc='grey', ms=3, elinewidth=2,
                        label='Binned data')
 
+
+
         if plot_power_law:
             #-- fitting a power-law
             P, C = self.fit_surface_height(r0 = r0)
@@ -920,6 +1028,14 @@ class Surface:
 
             ax[0].plot(x, P[0] * ((x/r0)**P[1]) * np.exp(-(x/P[2]) ** P[3]), color='k', ls='-.', alpha=0.75,
                        label='Tapered PL')
+
+        if plot_gp:
+            t, mu, std = self.fit_surface_height_gp()
+            # Plot the data
+            color = "#ff7f0e"
+            ax[0].plot(t, mu, color="red", markersize=1.0)
+            ax[0].fill_between(t, mu+std, mu-std, color=color, alpha=0.3, edgecolor="none")
+
 
         #Velocity
         ax[1].scatter(r.ravel(),v.ravel(),alpha=0.2,s=3,c=dv.ravel(),marker='o', label='Data',cmap="jet")
@@ -1012,6 +1128,73 @@ class Surface:
             #ax.set_ylim(np.min(y[iv,:n_surf[iv],:]) - 10*cube.bmaj/cube.pixelscale,np.max(y[iv,:n_surf[iv],:]) + 10*cube.bmaj/cube.pixelscale)
 
         ax.plot(self.x_star_rot,self.y_star_rot,"*",color="yellow",ms=3)
+
+
+    def plot_channel_multiscale(self, iv, radius=3.0, ax=None, clear=True):
+        # plot 1 channel and all the multiscale extraction
+
+        if ax is None:
+            ax = plt.gca()
+
+        if clear:
+            ax.cla()
+
+        cube = self.cube
+        x = self.x_sky
+        y = self.y_sky
+        n_surf = self.n_surf
+
+        iscale=0
+        im = np.nan_to_num(self.rotated_images[iscale,iv-self.iv_min,:,:])
+        # Array is rotated already
+        #if self.PA is not None:
+        #    im = np.array(rotate(im, self.PA - self.inc_sign * 90.0, reshape=False))
+
+        ax.imshow(im, origin="lower", cmap='binary_r')
+        ax.set_title(r'$\Delta$v='+"{:.2f}".format(cube.velocity[iv] - self.v_syst)+' , id:'+str(iv), color='k')
+
+        for iscale in range(self.n_scales):
+            ax.plot(x[iscale,iv,:n_surf[iscale,iv]],y[iscale,iv,:n_surf[iscale,iv],0],"o",color="red",markersize=1)
+            ax.plot(x[iscale,iv,:n_surf[iscale,iv]],y[iscale,iv,:n_surf[iscale,iv],1],"o",color="blue",markersize=1)
+            ax.plot(x[iscale,iv,:n_surf[iscale,iv]],np.mean(y[iscale,iv,:n_surf[iscale,iv],:],axis=1),"o",color="white",markersize=1)
+
+
+    def plot_channel_multiscales(self, iv, radius=3.0, clear=True, num=21):
+        # plot 1 channel and all the multiscale extraction on multiple panels
+
+        ncols = int(np.ceil((self.n_scales+1)/2))
+        fig, axs = plt.subplots(ncols=ncols, nrows=2, figsize=(2*ncols+1, 5),constrained_layout=True,num=num,
+                                clear=False, sharex=True, sharey=True)
+        cube = self.cube
+        x = self.x_sky
+        y = self.y_sky
+        n_surf = self.n_surf
+
+        iscale=0
+        im = np.nan_to_num(self.rotated_images[iscale,iv-self.iv_min,:,:])
+        # Array is rotated already
+        #if self.PA is not None:
+        #    im = np.array(rotate(im, self.PA - self.inc_sign * 90.0, reshape=False))
+
+        ax0 = axs.ravel()[0]
+        ax0.imshow(im, origin="lower", cmap='binary_r')
+        ax0.set_title(r'$\Delta$v='+"{:.2f}".format(cube.velocity[iv] - self.v_syst)+' , id:'+str(iv), color='k')
+
+        for iscale in range(self.n_scales):
+            ax = axs.ravel()[iscale+1]
+
+            im = np.nan_to_num(self.rotated_images[iscale,iv-self.iv_min,:,:])
+            ax.imshow(im, origin="lower", cmap='binary_r')
+
+            ax.plot(x[iscale,iv,:n_surf[iscale,iv]],y[iscale,iv,:n_surf[iscale,iv],0],"o",color="red",markersize=1)
+            ax.plot(x[iscale,iv,:n_surf[iscale,iv]],y[iscale,iv,:n_surf[iscale,iv],1],"o",color="blue",markersize=1)
+            ax.plot(x[iscale,iv,:n_surf[iscale,iv]],np.mean(y[iscale,iv,:n_surf[iscale,iv],:],axis=1),"o",color="white",markersize=1)
+
+            ax0.plot(x[iscale,iv,:n_surf[iscale,iv]],y[iscale,iv,:n_surf[iscale,iv],0],"o",color="red",markersize=1)
+            ax0.plot(x[iscale,iv,:n_surf[iscale,iv]],y[iscale,iv,:n_surf[iscale,iv],1],"o",color="blue",markersize=1)
+            ax0.plot(x[iscale,iv,:n_surf[iscale,iv]],np.mean(y[iscale,iv,:n_surf[iscale,iv],:],axis=1),"o",color="white",markersize=1)
+
+
 
     def plot_channels(self,n=20, num=21, radius=1.0, iv_min=None, iv_max=None, save=False, iscale=0):
 
@@ -1175,6 +1358,52 @@ class Surface:
         popt, copt = curve_fit(func, r, h, sigma = error, bounds=bnds, maxfev = 100000)
 
         return popt, copt
+
+
+    def fit_surface_height_gp(self):
+
+        x = np.array(self.r.ravel().compressed())
+        y = self.h.ravel().compressed()
+        yerr = 1/(np.mean(self.snr[:,:,:,:],axis=3).ravel()[np.invert(self.r.mask.ravel())])
+
+        order=np.argsort(x)
+        x=x[order]
+        y=y[order]
+        yerr=yerr[order]
+
+        # Set up the GP model
+        k0 = terms.JitterTerm(log_sigma=np.log(np.var(y)))
+        k1 = terms.RealTerm(log_a=np.log(np.var(y)), log_c=np.log(50))
+        k2 = terms.RealTerm(log_a=np.log(np.var(y)), log_c=np.log(5))
+        kernel = k0+k1+k2
+        kernel = k0+k2
+        gp = celerite.GP(kernel, fit_mean=False)
+
+        # Define a cost function
+        def neg_log_like(params, y, gp):
+            gp.set_parameter_vector(params)
+            return -gp.log_likelihood(y)
+
+        def grad_neg_log_like(params, y, gp):
+            gp.set_parameter_vector(params)
+            return -gp.grad_log_likelihood(y)[1]
+
+        gp.compute(x, yerr)
+
+        initial_params = gp.get_parameter_vector()
+        bounds = gp.get_parameter_bounds()
+
+        #soln = minimize(nll, initial_params, jac=True)
+        soln = minimize(neg_log_like, initial_params, jac=grad_neg_log_like,method="L-BFGS-B", bounds=bounds, args=(y, gp))
+        gp.set_parameter_vector(soln.x)
+
+        # Make the maximum likelihood prediction
+        t = np.linspace(np.min(x), np.max(x), 500)
+
+        mu, var = gp.predict(y, t, return_var=True)
+        std = np.sqrt(var)
+
+        return t, mu, std
 
 
 def search_maxima_old(y, height=None, dx=0, prominence=0):
