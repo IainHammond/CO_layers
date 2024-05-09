@@ -52,8 +52,10 @@ class Surface:
                  num: int = 0,
                  plot: bool = True,
                  std: float = None,
-                 min_iv: int = None,
-                 max_iv: int = None,
+                 vmin: float = None,
+                 vmax: float = None,
+                 iv_min: int = None,
+                 iv_max: int = None,
                  no_scales: bool = False,
                  scales = None,
                  only_guess: bool = False,
@@ -109,14 +111,19 @@ class Surface:
             cube = casa_cube.Cube(cube)
 
         # Truncating the cube is velocity if needed
-        if min_iv is not None:
-            if max_iv is None:
-                raise ValueError("max_iv is required is min_iv is provided")
+        if vmin is not None:
+            iv_min = np.argmin(np.abs(cube.velocity - vmin))
+        if vmax is not None:
+            iv_max = np.argmin(np.abs(cube.velocity - vmax))
+
+        if iv_min is not None:
+            if iv_max is None:
+                raise ValueError("iv_max is required if iv_min is provided")
 
             print("Truncating cube in velocity")
-            cube.image = cube.image[min_iv:max_iv+1,:,:]
-            cube.velocity = cube.velocity[min_iv:max_iv+1]
-            cube.nv = max_iv-min_iv+1
+            cube.image = cube.image[iv_min:iv_max+1,:,:]
+            cube.velocity = cube.velocity[iv_min:iv_max+1]
+            cube.nv = iv_max-iv_min+1
 
         self.cube = cube
 
@@ -125,9 +132,6 @@ class Surface:
         self.sigma = sigma
 
         self._initial_guess(num=num,std=std)
-        if (only_guess):
-            print("Exiting: only performing initial guess ")
-            return
 
         self.exclude_inner_beam = exclude_inner_beam
 
@@ -149,12 +153,12 @@ class Surface:
             self.x_star = (self.cube.nx-1)/2 +  dRA/self.cube.pixelscale
             self.y_star = (self.cube.ny-1)/2 + dDec/self.cube.pixelscale
 
-
+        if (only_guess):
+            print("Exiting: only performing initial guess ")
+            return
 
         # This is where the actual work happens
         self._rotate_cube()
-
-        self._get_disk_size(num=num)
 
         if no_scales:
             self.n_scales=1
@@ -175,7 +179,7 @@ class Surface:
 
         # Making plots
         if plot:
-            self.plot_channels(num=num+8)
+            self.plot_channels(num=num+9)
 
         if inc is not None:
             print("Forcing inclination to ", inc, " deg")
@@ -190,10 +194,26 @@ class Surface:
             self.dist = dist
             self.fit_central_mass(dist=dist)
             if plot:
-                self.plot_surfaces(num=num+9,m_star=self.m_star,dist=dist)
+                self.plot_surfaces(num=num+10,m_star=self.m_star,dist=dist)
         else:
             if plot:
-                self.plot_surfaces(num=num+9)
+                self.plot_surfaces(num=num+10)
+
+        return
+
+    def cutout(self,FOV=None):
+
+        new_file=self.cube.filename.replace(".fits","_cutout.fits")
+        iv_buffer = 3
+
+        if FOV is None:
+            FOV = self.image_size * 1.25
+
+        print("Cutting out to a FOV of ", FOV, "arcsec")
+        print("Velocity channels between", self.iv_min-iv_buffer, "and", self.iv_max+iv_buffer)
+        print("ie, between", self.cube.velocity[self.iv_min-iv_buffer], "and", self.cube.velocity[self.iv_max+iv_buffer], "km/s")
+
+        self.cube.cutout(new_file,FOV=FOV,overwrite=True,iv_min=self.iv_min-iv_buffer,iv_max=self.iv_max+iv_buffer)
 
         return
 
@@ -228,8 +248,9 @@ class Surface:
         nv = self.cube.nv
         iv_min = nv-1
         iv_max = 0
+        min_image = np.min(image,axis=0) # proxy for continuum if present
         for i in range(nv):
-            if np.max(image[i,:,:]) > 10*std:
+            if np.max(image[i,:,:] - min_image) > 10*std:
                 iv_min = np.minimum(iv_min,i)
                 iv_max = np.maximum(iv_max,i)
 
@@ -314,7 +335,9 @@ class Surface:
 
         plt.plot([self.v_syst,self.v_syst], [0.,1.05*np.max(profile)], lw=1, color="C3", alpha=0.7)
 
+        # --------------------------------
         # Fitting v_syst from line wings
+        # --------------------------------
         background = 0.5 * (profile[iv_min]+profile[iv_max])
         delta_profile = np.max(profile) - background
 
@@ -464,6 +487,10 @@ class Surface:
         else:
             self.inc_sign = -1
 
+        #---------------------------------
+        # 4. Estimated size of image
+        #---------------------------------
+        self._get_image_size(num=num)
 
         return
 
@@ -484,11 +511,36 @@ class Surface:
 
         return
 
-    def _get_disk_size(self,num=0):
+    def _get_image_size(self,num=0):
+        # get size of image with flux
         plt.figure(num+7)
+        plt.clf()
+        self.cube.plot(moment=0, threshold=3*self.cube.std, iv_support=np.arange(self.iv_min,self.iv_max+1),axes_unit="pixel")
+        M0 = self.cube.last_image
+
+        # Find x index of pixels with signals
+        ou = np.where(np.isfinite(np.nanmax(M0,axis=0)))
+        disk_size = (np.max(ou) - np.min(ou))  * self.cube.pixelscale
+        self.disk_size = disk_size
+
+        # Find y index of pixels with signals
+        ou = np.where(np.isfinite(np.nanmax(M0,axis=1)))
+        disk_size2 = (np.max(ou) - np.min(ou))  * self.cube.pixelscale
+
+        self.image_size = np.maximum(disk_size,disk_size2)
+
+        print("Actual size of image (ie with flux) is ~", self.image_size, "arcsec")
+
+        return
+
+
+    def _get_disk_size(self,num=0):
+        plt.figure(num+8)
         plt.clf()
         self.cube.plot(moment=0, threshold=5*self.cube.std, iv_support=np.arange(self.iv_min,self.iv_max+1),axes_unit="pixel")
         M0 = self.cube.last_image
+
+        # We have rotated the cube beforehand
         self.M0 = M0
 
         # Find x index of pixels with signals
@@ -502,6 +554,8 @@ class Surface:
 
         print("Disk size is ", disk_size, "x", disk_size2, " arcsec")
         print("Aspect ratio suggests inclination close to:", np.arccos(disk_size2/disk_size) * 180./np.pi), " deg"
+
+        self.disk_size = [disk_size,disk_size2]
 
         return
 
@@ -1382,7 +1436,7 @@ class Surface:
         v = self.v[scales,:,:].ravel().compressed()
 
         #using 1/snr as the error on the velocity
-        v_error = 1/(np.mean(self.snr[scales,:,:,:],axis=2).ravel()[np.invert(self.r[scales,:,:].mask.ravel())])
+        v_error = 1/(np.mean(self.snr[scales,:,:,:],axis=-1).ravel()[np.invert(self.r[scales,:,:].mask.ravel())])
 
         # chi2
         chi2 = np.sum(((v - v_model)**2 / v_error**2) + np.log(2*np.pi*v_error**2))
@@ -1452,6 +1506,66 @@ class Surface:
         popt, copt = curve_fit(func, r, h, sigma = error, bounds=bnds, maxfev = 100000)
 
         return popt, copt
+
+
+    def to_mcfost(self, planet_r=0., planet_PA=0.):
+        # For a given planet projected separation and PA,
+        # this function gives the mcfost inclination, as well as the
+        # az to be passed to the planet_az option and the deprojected separation
+        #
+        # input:
+        # ------
+        # dynamite model + planet radius in arcsec or au, and planet PA in deg (in plane of sky, East from North)
+        #
+        # output:
+        # -------
+        # inclination in degrees to set in parameter file
+        # planet radius (eg to set in hydro simulations). It will be in same unit as planet_r
+        # planet_az in degrees (this is passed to mcfost via cmd line option)
+
+        # Note that pymcfost.get_planet_rPA does the opposite from a mcfost image
+
+        inc = self.inc * self.inc_sign
+
+        dPA = planet_PA - self.PA
+
+
+
+        #az = np.arctan(np.tan(np.deg2rad(dPA)) / np.cos(np.deg2rad(self.inc)))
+
+        y = np.sin(np.deg2rad(dPA)) / np.cos(np.deg2rad(inc))
+        x = np.cos(np.deg2rad(dPA))
+        az = np.arctan2(y,x)
+
+        az = - np.rad2deg(az) # conversion to deg and correct convention for mcfost
+
+        y_p = planet_r * np.sin(np.deg2rad(dPA))
+        x_p = planet_r * np.cos(np.deg2rad(dPA))
+
+        x = x_p
+        y = y_p / np.cos(np.deg2rad(inc))
+
+        r = np.hypot(x,y)
+
+        # test :
+        #mcfost.get_planet_r_az(62.5,50.2, 0.60521173 * 157.2, 11.619613647460938)
+        # should give : (130.00000395126042, 62.500002877567475)
+
+        # mcfost inclination is opposite to dynamite (which mattches discminer for convenience)
+        if (inc<0):
+            mcfost_inc=-inc
+        else: # to avoid the bug in red/blue PA with negative inclination in mcfost
+            mcfost_inc=180-inc
+            az = -az
+
+        print("MCFOST parameters should be:")
+        print("i=",mcfost_inc,"deg")
+        print("PA=",self.PA,"deg")
+        print("planet r=",r,"au")
+        print("planet az=",az,"deg (for cmd line option)")
+
+        return mcfost_inc, r, az
+
 
 
     def fit_surface_height_gp(self):
